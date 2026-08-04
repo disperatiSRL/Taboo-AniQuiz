@@ -1,0 +1,12 @@
+{
+  "name": "taboo-multiplayer-server",
+  "version": "1.0.0",
+  "description": "Server multiplayer per il gioco Taboo",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.14.2"
+  }
+}
