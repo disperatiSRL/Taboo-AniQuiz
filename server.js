@@ -1,11 +1,11 @@
-// server.js - Versione con logica Taboo multiplayer
+// server.js - Taboo Multiplayer con squadre A/B e cambio squadra dinamico
 const WebSocket = require('ws');
 const http = require('http');
 
 // ---------- Configurazione ----------
 const PORT = process.env.PORT || 8080;
 
-// ---------- Mazzo di carte ----------
+// ---------- Mazzo di carte (completo) ----------
 const CARDS = [
     { word: "Gatto", forbidden: ["Felino", "Animale", "Domestico", "Zampa"] },
     { word: "Pizza", forbidden: ["Impasto", "Mozzarella", "Pomodoro", "Forno"] },
@@ -31,6 +31,7 @@ const CARDS = [
     { word: "Cameriere", forbidden: ["Ristorante", "Tavolo", "Ordinare", "Mancia"] },
     { word: "Pioggia", forbidden: ["Acqua", "Ombrello", "Nuvola", "Bagnato"] },
     { word: "Pesce", forbidden: ["Acqua", "Branchie", "Pinne", "Mare"] },
+    { word: "Mountain bike", forbidden: ["Montagna", "Ruote", "Sterzo", "Freno"] },
     { word: "Sole", forbidden: ["Luce", "Caldo", "Giallo", "Giorno"] },
     { word: "Ospedale", forbidden: ["Medico", "Malato", "Infermiere", "Operazione"] },
     { word: "Girasole", forbidden: ["Fiore", "Giallo", "Semi", "Campo"] },
@@ -85,6 +86,7 @@ function getRoom(roomId) {
                 cards: shuffleArray([...CARDS]),
                 currentIndex: 0,
                 scores: {},
+                teamScores: { A: 0, B: 0 },
                 currentDescriber: null,
                 timeLeft: 60,
                 isPlaying: false,
@@ -114,7 +116,6 @@ function removePlayer(playerId) {
     const roomId = p.room;
     const room = rooms[roomId];
     if (room) {
-        // Se il giocatore era il descrittore, rimuovilo
         const game = room.gameState;
         if (game.currentDescriber === playerId) {
             game.currentDescriber = null;
@@ -162,7 +163,6 @@ function startTimer(roomId) {
         game.timeLeft--;
         broadcastGameState(roomId);
         if (game.timeLeft <= 0) {
-            // Tempo scaduto -> skip automatico
             stopTimer(roomId);
             if (game.currentDescriber && !game.finished) {
                 const describer = game.currentDescriber;
@@ -191,7 +191,6 @@ function nextCard(roomId) {
         broadcastGameState(roomId);
         return;
     }
-    // Reset timer e riparti
     if (game.isPlaying) {
         startTimer(roomId);
     }
@@ -202,20 +201,45 @@ function broadcastGameState(roomId) {
     const room = rooms[roomId];
     if (!room) return;
     const game = room.gameState;
-    const state = {
-        cards: game.cards,
-        currentIndex: game.currentIndex,
-        scores: game.scores,
-        currentDescriber: game.currentDescriber,
-        timeLeft: game.timeLeft,
-        isPlaying: game.isPlaying,
-        finished: game.finished,
-        players: room.players
-    };
-    broadcastToRoom(roomId, {
-        type: 'state',
-        state: state
-    });
+    const players = room.players;
+
+    for (const pid in players) {
+        const p = players[pid];
+        if (!p.ws || p.ws.readyState !== WebSocket.OPEN) continue;
+
+        const isDesc = (pid === game.currentDescriber);
+        const isActive = game.isPlaying && !game.finished && game.currentIndex < game.cards.length;
+
+        const stateForPlayer = {
+            currentDescriber: game.currentDescriber,
+            timeLeft: game.timeLeft,
+            isPlaying: game.isPlaying,
+            finished: game.finished,
+            players: players,
+            scores: game.scores,
+            teamScores: game.teamScores,
+            isMeDescriber: isDesc,
+            card: null
+        };
+
+        if (isActive && isDesc) {
+            const card = game.cards[game.currentIndex];
+            stateForPlayer.card = {
+                word: card.word,
+                forbidden: card.forbidden
+            };
+        } else {
+            stateForPlayer.card = {
+                word: "🤫",
+                forbidden: ["???"]
+            };
+        }
+
+        p.ws.send(JSON.stringify({
+            type: 'state',
+            state: stateForPlayer
+        }));
+    }
 }
 
 function handleAction(roomId, playerId, action, data) {
@@ -227,14 +251,12 @@ function handleAction(roomId, playerId, action, data) {
 
     switch (action) {
         case 'newTurn': {
-            // Se il gioco è finito o non è iniziato, resetta e inizia
-            if (game.finished || !game.isPlaying) {
-                // Mescola le carte e resetta i punteggi?
-                // Se vogliamo mantenere i punteggi, non resettiamo.
-                // Ricominciamo con un mazzo nuovo e indice 0
-                game.cards = shuffleArray([...CARDS]);
-                game.currentIndex = 0;
-                game.finished = false;
+            if (game.finished || !game.isPlaying || game.currentDescriber === null) {
+                if (game.finished) {
+                    game.cards = shuffleArray([...CARDS]);
+                    game.currentIndex = 0;
+                    game.finished = false;
+                }
                 game.currentDescriber = playerId;
                 game.isPlaying = true;
                 if (!game.scores[playerId]) {
@@ -242,15 +264,15 @@ function handleAction(roomId, playerId, action, data) {
                 }
                 startTimer(roomId);
                 broadcastGameState(roomId);
-            } else {
-                // Se già in corso, non fare nulla (o passa alla prossima carta?)
-                // Per evitare confusione, ignoriamo
             }
             break;
         }
         case 'correct': {
-            if (!game.isPlaying || game.finished || !game.currentDescriber) return;
-            const describer = game.currentDescriber;
+            if (!game.isPlaying || game.finished || game.currentDescriber !== playerId) return;
+            const describer = playerId;
+            const team = player.team;
+            if (team === 'A') game.teamScores.A++;
+            else if (team === 'B') game.teamScores.B++;
             if (!game.scores[describer]) {
                 game.scores[describer] = { correct: 0, skip: 0, foul: 0 };
             }
@@ -260,8 +282,8 @@ function handleAction(roomId, playerId, action, data) {
             break;
         }
         case 'skip': {
-            if (!game.isPlaying || game.finished || !game.currentDescriber) return;
-            const describer = game.currentDescriber;
+            if (!game.isPlaying || game.finished || game.currentDescriber !== playerId) return;
+            const describer = playerId;
             if (!game.scores[describer]) {
                 game.scores[describer] = { correct: 0, skip: 0, foul: 0 };
             }
@@ -272,9 +294,13 @@ function handleAction(roomId, playerId, action, data) {
         }
         case 'foul': {
             if (!game.isPlaying || game.finished || !game.currentDescriber) return;
-            // Solo i non-descrittori possono fare fallo
             if (playerId === game.currentDescriber) return;
             const describer = game.currentDescriber;
+            const describerPlayer = playerMap[describer];
+            if (!describerPlayer) return;
+            const teamFoul = player.team;
+            if (teamFoul === 'A') game.teamScores.A++;
+            else if (teamFoul === 'B') game.teamScores.B++;
             if (!game.scores[describer]) {
                 game.scores[describer] = { correct: 0, skip: 0, foul: 0 };
             }
@@ -284,18 +310,28 @@ function handleAction(roomId, playerId, action, data) {
             break;
         }
         case 'reset': {
-            // Reset completo: nuovi punteggi, nuovo mazzo, stop timer
             stopTimer(roomId);
             game.cards = shuffleArray([...CARDS]);
             game.currentIndex = 0;
             game.scores = {};
+            game.teamScores = { A: 0, B: 0 };
             game.currentDescriber = null;
             game.isPlaying = false;
             game.finished = false;
-            // Punteggi azzerati per tutti
             for (const pid in room.players) {
                 game.scores[pid] = { correct: 0, skip: 0, foul: 0 };
             }
+            broadcastGameState(roomId);
+            break;
+        }
+        // Cambio squadra
+        case 'changeTeam': {
+            const newTeam = data.team;
+            if (!newTeam || (newTeam !== 'A' && newTeam !== 'B')) {
+                // rispondi con errore?
+                return;
+            }
+            player.team = newTeam;
             broadcastGameState(roomId);
             break;
         }
@@ -304,7 +340,7 @@ function handleAction(roomId, playerId, action, data) {
     }
 }
 
-// ---------- Crea server HTTP ----------
+// ---------- Server HTTP ----------
 const server = http.createServer((req, res) => {
     if (req.url === '/health') {
         res.writeHead(200);
@@ -315,7 +351,7 @@ const server = http.createServer((req, res) => {
     }
 });
 
-// ---------- WebSocket Server ----------
+// ---------- WebSocket ----------
 const wss = new WebSocket.Server({ server });
 
 wss.on('headers', (headers) => {
@@ -337,6 +373,7 @@ wss.on('connection', (ws, req) => {
                 case 'connect': {
                     const playerName = data.playerName || 'Anonimo';
                     const roomId = data.room || 'default';
+                    const team = data.team || 'A';
 
                     if (currentPlayerId && playerMap[currentPlayerId]) {
                         removePlayer(currentPlayerId);
@@ -349,7 +386,7 @@ wss.on('connection', (ws, req) => {
                     const player = {
                         id: playerId,
                         name: playerName,
-                        ready: false,
+                        team: team,
                         ws: ws,
                         room: roomId
                     };
@@ -358,7 +395,6 @@ wss.on('connection', (ws, req) => {
                     currentPlayerId = playerId;
                     currentRoomId = roomId;
 
-                    // Inizializza punteggio se non esiste
                     if (!game.scores[playerId]) {
                         game.scores[playerId] = { correct: 0, skip: 0, foul: 0 };
                     }
@@ -367,18 +403,18 @@ wss.on('connection', (ws, req) => {
                         type: 'connected',
                         playerId: playerId,
                         playerName: playerName,
-                        room: roomId
+                        room: roomId,
+                        team: team
                     }));
 
                     broadcastToRoom(roomId, {
                         type: 'playerJoined',
-                        player: { id: playerId, name: playerName, ready: false }
+                        player: { id: playerId, name: playerName, team: team }
                     }, ws);
 
-                    // Invia lo stato completo
                     broadcastGameState(roomId);
 
-                    console.log(`[${new Date().toISOString()}] ${playerName} (${playerId}) è entrato in stanza ${roomId}`);
+                    console.log(`[${new Date().toISOString()}] ${playerName} (${playerId}) team ${team} in stanza ${roomId}`);
                     break;
                 }
 
@@ -425,7 +461,6 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// Avvia il server
 server.listen(PORT, () => {
     console.log(`🚀 Server Taboo multiplayer in ascolto sulla porta ${PORT}`);
 });
